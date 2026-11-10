@@ -9,6 +9,8 @@ environment:
 dependencies:
   nvim:
     path: ../nvim
+  viff:
+    path: ../viff
   visettings:
     path: ../visettings
 

@@ -56,6 +56,27 @@ void main() {
       expect(await File(movedPath).readAsString(), '# Title');
     });
 
+    test('duplicates files and directories with non-colliding names', () async {
+      final srcFile = await FileOps.createFile(tempDir.path, 'data.json');
+      await File(srcFile).writeAsString('{"key": 1}');
+
+      final dup1 = await FileOps.duplicate(srcFile);
+      expect(FileOps.basename(dup1), 'data_copy.json');
+      expect(await File(dup1).exists(), isTrue);
+      expect(await File(dup1).readAsString(), '{"key": 1}');
+
+      final dup2 = await FileOps.duplicate(srcFile);
+      expect(FileOps.basename(dup2), 'data_copy2.json');
+      expect(await File(dup2).exists(), isTrue);
+
+      final srcDir = await FileOps.createFolder(tempDir.path, 'pkg');
+      await FileOps.createFile(srcDir, 'index.dart');
+      final dupDir = await FileOps.duplicate(srcDir);
+      expect(FileOps.basename(dupDir), 'pkg_copy');
+      expect(await Directory(dupDir).exists(), isTrue);
+      expect(await File('$dupDir/index.dart').exists(), isTrue);
+    });
+
     test('computes relativePath from workspace root', () {
       expect(
         FileOps.relativePath('/workspace/project', '/workspace/project/lib/src/main.dart'),
@@ -68,6 +89,39 @@ void main() {
       expect(
         FileOps.relativePath('/workspace/project', '/workspace/project'),
         '.',
+      );
+    });
+
+    test('openExternal and revealInFinder invoke OS launcher and reject missing paths', () async {
+      final createdFile = await FileOps.createFile(tempDir.path, 'doc.pdf');
+      final calls = <(String, List<String>)>[];
+
+      Future<ProcessResult> fakeRunner(String exe, List<String> args) async {
+        calls.add((exe, args));
+        return ProcessResult(1, 0, '', '');
+      }
+
+      await FileOps.openExternal(createdFile, runProcess: fakeRunner);
+      expect(calls, hasLength(1));
+      if (Platform.isMacOS) {
+        expect(calls.last.$1, 'open');
+        expect(calls.last.$2, [FileOps.normalizePath(createdFile)]);
+      }
+
+      await FileOps.revealInFinder(createdFile, runProcess: fakeRunner);
+      expect(calls, hasLength(2));
+      if (Platform.isMacOS) {
+        expect(calls.last.$1, 'open');
+        expect(calls.last.$2, ['-R', FileOps.normalizePath(createdFile)]);
+      }
+
+      expect(
+        () => FileOps.openExternal('${tempDir.path}/missing.txt', runProcess: fakeRunner),
+        throwsStateError,
+      );
+      expect(
+        () => FileOps.revealInFinder('${tempDir.path}/missing.txt', runProcess: fakeRunner),
+        throwsStateError,
       );
     });
   });

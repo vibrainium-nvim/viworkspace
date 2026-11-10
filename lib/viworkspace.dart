@@ -1,4 +1,5 @@
 export 'package:nvim/nvim.dart';
+export 'package:viff/viff.dart';
 export 'package:visettings/visettings.dart';
 
 export 'src/fs/file_ops.dart';

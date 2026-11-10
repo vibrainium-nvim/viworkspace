@@ -75,24 +75,37 @@ class RenderedWorkspaceTree {
 
 class WorkspaceTreeState {
   final Set<String> expandedDirs = {};
+  final Set<String> searchExpandedDirs = {};
   bool showHidden = false;
   bool ignoreExclude = false;
   VibrainiumSettings settings = const VibrainiumSettings();
   ClipboardEntry? clipboard;
   String? activeFilePath;
 
+  String searchQuery = '';
+  List<String> searchMatches = const [];
+  int currentMatchIndex = -1;
+
+  String? get currentMatchPath =>
+      (currentMatchIndex >= 0 && currentMatchIndex < searchMatches.length)
+          ? searchMatches[currentMatchIndex]
+          : null;
+
   bool isDirExpanded(String dirPath) =>
       expandedDirs.contains(FileOps.normalizePath(dirPath));
 
   void toggleDir(String dirPath) {
     final norm = FileOps.normalizePath(dirPath);
+    searchExpandedDirs.remove(norm);
     if (!expandedDirs.remove(norm)) {
       expandedDirs.add(norm);
     }
   }
 
   void expandDir(String dirPath) {
-    expandedDirs.add(FileOps.normalizePath(dirPath));
+    final norm = FileOps.normalizePath(dirPath);
+    searchExpandedDirs.remove(norm);
+    expandedDirs.add(norm);
   }
 
   /// Marks [filePath] as the active file and expands all ancestor directories
@@ -111,12 +124,176 @@ class WorkspaceTreeState {
     var currentDir = FileOps.normalizePath(FileOps.dirname(normFile));
     while (currentDir.length > normRoot.length &&
         currentDir.startsWith(rootPrefix)) {
+      searchExpandedDirs.remove(currentDir);
       expandedDirs.add(currentDir);
       final parent = FileOps.normalizePath(FileOps.dirname(currentDir));
       if (parent == currentDir) break;
       currentDir = parent;
     }
     return true;
+  }
+
+  /// Collapses any directories that were only auto-expanded for a previous
+  /// search match, then auto-expands ancestor directories of [matchPath]
+  /// (recording newly opened directories in [searchExpandedDirs]).
+  void revealSearchMatch(String rootPath, String? matchPath) {
+    expandedDirs.removeAll(searchExpandedDirs);
+    searchExpandedDirs.clear();
+    if (matchPath == null || matchPath.trim().isEmpty) return;
+
+    final normRoot = FileOps.normalizePath(rootPath);
+    final normMatch = FileOps.normalizePath(matchPath);
+    final rootPrefix = normRoot.endsWith('/') ? normRoot : '$normRoot/';
+    if (!normMatch.startsWith(rootPrefix)) return;
+
+    var currentDir = FileOps.normalizePath(FileOps.dirname(normMatch));
+    while (currentDir.length > normRoot.length &&
+        currentDir.startsWith(rootPrefix)) {
+      if (!expandedDirs.contains(currentDir)) {
+        expandedDirs.add(currentDir);
+        searchExpandedDirs.add(currentDir);
+      }
+      final parent = FileOps.normalizePath(FileOps.dirname(currentDir));
+      if (parent == currentDir) break;
+      currentDir = parent;
+    }
+  }
+
+  /// Clears the active search state. When [collapseAutoExpanded] is `true`,
+  /// also collapses directories that were only auto-expanded by search.
+  void clearSearch({bool collapseAutoExpanded = false}) {
+    if (collapseAutoExpanded) {
+      expandedDirs.removeAll(searchExpandedDirs);
+    }
+    searchExpandedDirs.clear();
+    searchQuery = '';
+    searchMatches = const [];
+    currentMatchIndex = -1;
+  }
+
+  /// Finds all matching directory and file paths under [rootDir] in tree order
+  /// using [query] as a regular expression.
+  Future<List<String>> findMatches(Directory rootDir, String query) async {
+    if (query.isEmpty) return const [];
+    final rootPath = FileOps.normalizePath(rootDir.path);
+    final settingsFile = File(VibrainiumSettings.settingsFilePath(rootPath));
+    if (await settingsFile.exists()) {
+      settings = await VibrainiumSettings.load(rootPath);
+    }
+    if (!await rootDir.exists()) return const [];
+
+    final hasUpper = query != query.toLowerCase();
+    RegExp regExp;
+    try {
+      regExp = RegExp(query, caseSensitive: hasUpper);
+    } on FormatException {
+      regExp = RegExp(RegExp.escape(query), caseSensitive: hasUpper);
+    }
+    final matchRelPath = query.contains('/');
+    final results = <String>[];
+
+    Future<void> walk(Directory dir) async {
+      List<FileSystemEntity> entities;
+      try {
+        entities = await dir.list(followLinks: false).toList();
+      } catch (_) {
+        return;
+      }
+
+      final subDirs = <(String, String, Directory)>[];
+      final files = <(String, String, FileSystemEntity)>[];
+
+      for (final entity in entities) {
+        final name = FileOps.basename(entity.path);
+        if (!showHidden && name.startsWith('.')) {
+          continue;
+        }
+        final isDir = entity is Directory;
+        final normEntityPath = FileOps.normalizePath(entity.path);
+        final relPath = normEntityPath.startsWith('$rootPath/')
+            ? normEntityPath.substring(rootPath.length + 1)
+            : name;
+        if (!ignoreExclude) {
+          if (settings.isWorkspaceExcluded(
+            relPath,
+            name: name,
+            isDirectory: isDir,
+          )) {
+            continue;
+          }
+        }
+        if (isDir) {
+          subDirs.add((name, relPath, entity));
+        } else {
+          files.add((name, relPath, entity));
+        }
+      }
+
+      subDirs.sort(
+        (a, b) => a.$1.toLowerCase().compareTo(b.$1.toLowerCase()),
+      );
+      files.sort(
+        (a, b) => a.$1.toLowerCase().compareTo(b.$1.toLowerCase()),
+      );
+
+      for (final (name, relPath, subDir) in subDirs) {
+        final normPath = FileOps.normalizePath(subDir.path);
+        final candidate = matchRelPath ? relPath : name;
+        if (regExp.hasMatch(candidate)) {
+          results.add(normPath);
+        }
+        await walk(subDir);
+      }
+
+      for (final (name, relPath, fileEntity) in files) {
+        final normPath = FileOps.normalizePath(fileEntity.path);
+        final candidate = matchRelPath ? relPath : name;
+        if (regExp.hasMatch(candidate)) {
+          results.add(normPath);
+        }
+      }
+    }
+
+    await walk(rootDir);
+    return results;
+  }
+
+  /// Updates the search query, finds all matches in [rootDir], selects the
+  /// first match, and auto-expands its ancestor directories (collapsing any
+  /// directories that were only auto-expanded for a previous match).
+  Future<String?> updateSearch(Directory rootDir, String query) async {
+    searchQuery = query;
+    if (query.isEmpty) {
+      searchMatches = const [];
+      currentMatchIndex = -1;
+      revealSearchMatch(rootDir.path, null);
+      return null;
+    }
+
+    final matches = await findMatches(rootDir, query);
+    searchMatches = matches;
+    if (matches.isEmpty) {
+      currentMatchIndex = -1;
+      revealSearchMatch(rootDir.path, null);
+      return null;
+    }
+
+    currentMatchIndex = 0;
+    final first = matches.first;
+    revealSearchMatch(rootDir.path, first);
+    return first;
+  }
+
+  /// Advances the active search match by [delta] (wrapping around), collapsing
+  /// prior search-only directories and expanding ancestors of the new match.
+  String? stepSearchMatch(String rootPath, int delta) {
+    if (searchMatches.isEmpty) return null;
+    final len = searchMatches.length;
+    final base = currentMatchIndex < 0 ? 0 : currentMatchIndex;
+    currentMatchIndex = ((base + delta) % len + len) % len;
+    final target = searchMatches[currentMatchIndex];
+    revealSearchMatch(rootPath, target);
+    return target;
   }
 
   void toggleHidden() {
@@ -165,11 +342,16 @@ class WorkspaceTreeState {
       [(0, _byteLen(headerText), 'ViworkspaceHeader')],
     );
 
+    final matchSet = searchMatches.toSet();
+    final activeMatch = currentMatchPath;
+
     if (await rootDir.exists()) {
       await _renderDirectoryChildren(
         rootPath: rootPath,
         dir: rootDir,
         depth: 0,
+        matchSet: matchSet,
+        activeMatch: activeMatch,
         addLine: addLine,
       );
     }
@@ -185,6 +367,8 @@ class WorkspaceTreeState {
     required String rootPath,
     required Directory dir,
     required int depth,
+    required Set<String> matchSet,
+    required String? activeMatch,
     required void Function(
       String text,
       WorkspaceNode node, [
@@ -246,16 +430,22 @@ class WorkspaceTreeState {
       final folderIcon = expanded
           ? WorkspaceIcons.folderOpen
           : WorkspaceIcons.folderClosed;
-      final mainPart = '$indent$chevron $folderIcon $name';
+      final prefixPart = '$indent$chevron $folderIcon ';
+      final mainPart = '$prefixPart$name';
       final clipTag = (activeClip != null &&
               FileOps.normalizePath(activeClip.path) == normPath)
           ? ' [${activeClip.mode.label}]'
           : '';
       final fullLine = '$mainPart$clipTag';
 
+      final prefixBytes = _byteLen(prefixPart);
       final mainBytes = _byteLen(mainPart);
       final spans = <(int, int, String)>[
         (0, mainBytes, 'ViworkspaceDirectory'),
+        if (normPath == activeMatch)
+          (prefixBytes, mainBytes, 'ViworkspaceSearchCurrent')
+        else if (matchSet.contains(normPath))
+          (prefixBytes, mainBytes, 'ViworkspaceSearchMatch'),
       ];
       if (clipTag.isNotEmpty) {
         spans.add((
@@ -281,6 +471,8 @@ class WorkspaceTreeState {
           rootPath: rootPath,
           dir: subDir,
           depth: depth + 1,
+          matchSet: matchSet,
+          activeMatch: activeMatch,
           addLine: addLine,
         );
       }
@@ -306,7 +498,19 @@ class WorkspaceTreeState {
 
       final spans = <(int, int, String)>[
         (prefixBytes, prefixBytes + iconBytes, iconGroup),
-        if (isActiveFile)
+        if (normPath == activeMatch)
+          (
+            prefixBytes + iconBytes + 1,
+            prefixBytes + iconBytes + nameBytes,
+            'ViworkspaceSearchCurrent',
+          )
+        else if (matchSet.contains(normPath))
+          (
+            prefixBytes + iconBytes + 1,
+            prefixBytes + iconBytes + nameBytes,
+            'ViworkspaceSearchMatch',
+          )
+        else if (isActiveFile)
           (
             prefixBytes + iconBytes,
             prefixBytes + iconBytes + nameBytes,

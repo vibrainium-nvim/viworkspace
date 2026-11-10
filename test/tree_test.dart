@@ -168,6 +168,91 @@ void main() {
         isTrue,
       );
     });
+
+    test('regex search expands first match, collapses auto-expanded dirs on next/prev while keeping pre-expanded dirs, and displays match index', () async {
+      await Directory('${workspaceDir.path}/alpha/sub_a').create(recursive: true);
+      await Directory('${workspaceDir.path}/beta/sub_b').create(recursive: true);
+      await Directory('${workspaceDir.path}/gamma').create(recursive: true);
+
+      final fileA = File('${workspaceDir.path}/alpha/sub_a/widget_test.dart');
+      final fileB = File('${workspaceDir.path}/beta/sub_b/router_test.dart');
+      final fileG = File('${workspaceDir.path}/gamma/keep_open.dart');
+      await fileA.writeAsString('');
+      await fileB.writeAsString('');
+      await fileG.writeAsString('');
+
+      final state = WorkspaceTreeState();
+      // Manually expand `gamma` before starting search
+      state.expandDir('${workspaceDir.path}/gamma');
+
+      // Search with regex `.*_test\.dart$`
+      final firstMatch = await state.updateSearch(workspaceDir, r'.*_test\.dart$');
+      expect(firstMatch, FileOps.normalizePath(fileA.path));
+      expect(state.searchMatches.length, 2);
+      expect(state.currentMatchIndex, 0);
+
+      // `alpha` and `alpha/sub_a` are auto-expanded; `beta` is still collapsed; `gamma` stays expanded
+      final renderedFirst = await state.build(workspaceDir);
+      expect(renderedFirst.lines, [
+        '❖ my_project',
+        '  alpha',
+        '    sub_a',
+        '       widget_test.dart',
+        '  beta',
+        '  gamma',
+        '     keep_open.dart',
+      ]);
+      expect(
+        renderedFirst.highlights.any(
+          (h) => h.line == 3 && h.group == 'ViworkspaceSearchCurrent',
+        ),
+        isTrue,
+      );
+
+      // Step to next match (`[2/2]`): `alpha/sub_a` auto-collapses, `beta/sub_b` auto-expands, `gamma` stays expanded
+      final secondMatch = state.stepSearchMatch(workspaceDir.path, 1);
+      expect(secondMatch, FileOps.normalizePath(fileB.path));
+      expect(state.currentMatchIndex, 1);
+
+      final renderedSecond = await state.build(workspaceDir);
+      expect(renderedSecond.lines, [
+        '❖ my_project',
+        '  alpha',
+        '  beta',
+        '    sub_b',
+        '       router_test.dart',
+        '  gamma',
+        '     keep_open.dart',
+      ]);
+
+      // Step previous (`-1`) wraps back to `[1/2]` and collapses `beta/sub_b`
+      final prevMatch = state.stepSearchMatch(workspaceDir.path, -1);
+      expect(prevMatch, FileOps.normalizePath(fileA.path));
+      expect(state.currentMatchIndex, 0);
+      expect(
+        state.isDirExpanded('${workspaceDir.path}/beta'),
+        isFalse,
+      );
+      expect(
+        state.isDirExpanded('${workspaceDir.path}/alpha/sub_a'),
+        isTrue,
+      );
+
+      // Relative path regex when `/` is present in query and directory match support
+      final dirMatch = await state.updateSearch(workspaceDir, r'^beta/sub_b$');
+      expect(
+        dirMatch,
+        FileOps.normalizePath('${workspaceDir.path}/beta/sub_b'),
+      );
+      expect(state.searchMatches.length, 1);
+      expect(state.isDirExpanded('${workspaceDir.path}/beta'), isTrue);
+      expect(state.isDirExpanded('${workspaceDir.path}/alpha'), isFalse);
+
+      // Incomplete regex `[` does not throw
+      await state.updateSearch(workspaceDir, '[');
+      expect(state.searchMatches, isEmpty);
+      expect(state.currentMatchIndex, -1);
+    });
   });
 
   group('WorkspaceIcons.iconForFile', () {

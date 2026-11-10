@@ -1,5 +1,10 @@
 import 'dart:io';
 
+typedef FileProcessRunner = Future<ProcessResult> Function(
+  String executable,
+  List<String> arguments,
+);
+
 enum ClipboardMode {
   copy('copy'),
   cut('cut');
@@ -182,6 +187,25 @@ class FileOps {
     return destPath;
   }
 
+  /// Duplicates a file or directory at [sourcePath] inside its parent directory with a non-colliding name.
+  static Future<String> duplicate(String sourcePath) async {
+    final type = await FileSystemEntity.type(sourcePath, followLinks: false);
+    if (type == FileSystemEntityType.notFound) {
+      throw StateError('Source does not exist: $sourcePath');
+    }
+
+    final parentDir = dirname(sourcePath);
+    final baseName = basename(sourcePath);
+    final destPath = await _nonCollidingCopyPath(parentDir, baseName);
+
+    if (type == FileSystemEntityType.directory) {
+      await _copyDirectory(Directory(sourcePath), Directory(destPath));
+    } else {
+      await File(sourcePath).copy(destPath);
+    }
+    return destPath;
+  }
+
   static Future<String> _nonCollidingCopyPath(
     String targetDir,
     String baseName,
@@ -221,6 +245,74 @@ class FileOps {
       } else if (entity is File) {
         await entity.copy(newPath);
       }
+    }
+  }
+
+  /// Opens [targetPath] using the OS default external application.
+  static Future<void> openExternal(
+    String targetPath, {
+    FileProcessRunner? runProcess,
+  }) async {
+    final normPath = normalizePath(targetPath);
+    final type = await FileSystemEntity.type(normPath, followLinks: false);
+    if (type == FileSystemEntityType.notFound) {
+      throw StateError('Path not found: $normPath');
+    }
+
+    final runner = runProcess ?? Process.run;
+    final ProcessResult result;
+    if (Platform.isMacOS) {
+      result = await runner('open', [normPath]);
+    } else if (Platform.isWindows) {
+      result = await runner('cmd', ['/c', 'start', '', normPath]);
+    } else {
+      result = await runner('xdg-open', [normPath]);
+    }
+
+    if (result.exitCode != 0) {
+      final err = result.stderr.toString().trim();
+      throw StateError(
+        err.isNotEmpty ? err : 'Exited with code ${result.exitCode}',
+      );
+    }
+  }
+
+  /// Reveals [targetPath] in the OS file manager (Finder / Explorer).
+  static Future<void> revealInFinder(
+    String targetPath, {
+    FileProcessRunner? runProcess,
+  }) async {
+    final normPath = normalizePath(targetPath);
+    final type = await FileSystemEntity.type(normPath, followLinks: false);
+    if (type == FileSystemEntityType.notFound) {
+      throw StateError('Path not found: $normPath');
+    }
+
+    final runner = runProcess ?? Process.run;
+    if (Platform.isMacOS) {
+      final result = await runner('open', ['-R', normPath]);
+      if (result.exitCode != 0) {
+        final err = result.stderr.toString().trim();
+        throw StateError(
+          err.isNotEmpty ? err : 'Exited with code ${result.exitCode}',
+        );
+      }
+      return;
+    }
+
+    if (Platform.isWindows) {
+      await runner('explorer', ['/select,$normPath']);
+      return;
+    }
+
+    final containerDir =
+        type == FileSystemEntityType.directory ? normPath : dirname(normPath);
+    final result = await runner('xdg-open', [containerDir]);
+    if (result.exitCode != 0) {
+      final err = result.stderr.toString().trim();
+      throw StateError(
+        err.isNotEmpty ? err : 'Exited with code ${result.exitCode}',
+      );
     }
   }
 }

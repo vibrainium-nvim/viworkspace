@@ -17,8 +17,10 @@ class _FakeNvimServer {
   int lastCreatedBuf = 0;
   final Map<int, List<String>> bufLines = {};
   final Map<int, Map<String, Object?>> bufOptions = {};
+  final Map<int, Map<String, Object?>> bufVars = {};
   final Map<int, String> bufNames = {};
   final Map<int, Map<String, String>> bufKeymaps = {};
+  final Map<String, String> bufModeKeymaps = {};
   final Set<int> validWins = {1};
   final Map<int, int> winBufs = {1: 0};
   final Map<int, Map<String, Object?>> winConfigs = {};
@@ -84,11 +86,17 @@ class _FakeNvimServer {
           bufOptions.putIfAbsent(buf, () => {})[name] = value;
         }
         return null;
+      case 'nvim_buf_set_var':
+        final buf = params[0] as int;
+        bufVars.putIfAbsent(buf, () => {})[params[1].toString()] = params[2];
+        return null;
       case 'nvim_buf_set_keymap':
         final buf = params[0] as int;
+        final mode = params[1].toString();
         final lhs = params[2].toString();
         final rhs = params[3].toString();
         bufKeymaps.putIfAbsent(buf, () => {})[lhs] = rhs;
+        bufModeKeymaps['$buf:$mode:$lhs'] = rhs;
         return null;
       case 'nvim_buf_clear_namespace':
         return null;
@@ -110,6 +118,11 @@ class _FakeNvimServer {
         return MsgpackExt(1, MsgpackCodec.encode(win));
       case 'nvim_win_get_config':
         return winConfigs[params[0] as int] ?? const <String, Object?>{};
+      case 'nvim_win_set_config':
+        final win = params[0] as int;
+        final cfg = (params[1] as Map).cast<String, Object?>();
+        winConfigs.putIfAbsent(win, () => {}).addAll(cfg);
+        return null;
       case 'nvim_win_get_buf':
         return winBufs[params[0] as int] ?? 0;
       case 'nvim_win_is_valid':
@@ -138,6 +151,10 @@ class _FakeNvimServer {
         return validWins.toList();
       case 'nvim_win_get_position':
         return [0, 0];
+      case 'nvim_win_get_width':
+        return 36;
+      case 'nvim_win_get_height':
+        return 30;
       case 'nvim_call_function':
         if (params[0] == 'getcwd') return cwd;
         if (params[0] == 'getmousepos') return mousePos;
@@ -199,11 +216,20 @@ void main() {
     });
 
     test('binds exact shortcuts and supports expand/open, new_file, new_folder, rename, copy/paste, delete, and toggle_hidden', () async {
+      final launched = <(String, List<String>)>[];
       final server = _FakeNvimServer(cwd: workspaceDir.path);
-      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+      final sidebar = WorkspaceSidebar(
+        nvim: Nvim(server.clientSession),
+        processRunner: (exe, args) async {
+          launched.add((exe, args));
+          return ProcessResult(1, 0, '', '');
+        },
+      );
 
       await server.serverSession.request('vibrainium_action', ['workspace.open']);
       expect(await sidebar.isOpen(), isTrue);
+      expect(server.winConfigs[100]!['win'], -1);
+      expect(server.winConfigs[100]!['split'], 'left');
       expect(server.winConfigs[100]!['style'], 'minimal');
       expect(server.winOptions[100]!['number'], isFalse);
       expect(server.winOptions[100]!['relativenumber'], isFalse);
@@ -215,8 +241,14 @@ void main() {
         server.bufKeymaps[1]!.keys.toSet(),
         {
           '<CR>',
+          'o',
+          'O',
+          'a',
+          'A',
+          '/',
           'n',
           'N',
+          '<Esc>',
           'r',
           'd',
           'c',
@@ -225,26 +257,56 @@ void main() {
           'y',
           'Y',
           'gy',
+          'm',
+          'M',
           '.',
           'e',
           'R',
           'q',
           '<LeftMouse>',
           '<2-LeftMouse>',
-          '<RightMouse>',
+          '<LeftDrag>',
+          '<2-LeftDrag>',
+          '<3-LeftDrag>',
+          '<4-LeftDrag>',
+          '<2-LeftRelease>',
+          '<3-LeftRelease>',
+          '<4-LeftRelease>',
+          '<3-LeftMouse>',
+          '<4-LeftMouse>',
+          'v',
+          'V',
+          '<C-v>',
         },
       );
       expect(
-        server.bufKeymaps[1]!['<LeftMouse>'],
+        server.bufModeKeymaps['1:n:<LeftMouse>'],
         "<LeftMouse><Cmd>lua require('vibrainium').action('workspace.click')<CR>",
       );
       expect(
-        server.bufKeymaps[1]!['<2-LeftMouse>'],
+        server.bufModeKeymaps['1:x:<LeftMouse>'],
+        "<C-\\><C-n><LeftMouse><Cmd>lua require('vibrainium').action('workspace.click')<CR>",
+      );
+      expect(
+        server.bufModeKeymaps['1:n:<2-LeftMouse>'],
         "<LeftMouse><Cmd>lua require('vibrainium').action('workspace.double_click')<CR>",
       );
       expect(
-        server.bufKeymaps[1]!['<RightMouse>'],
-        "<LeftMouse><Cmd>lua require('vibrainium').action('workspace.context_menu')<CR>",
+        server.bufModeKeymaps['1:x:<2-LeftMouse>'],
+        "<C-\\><C-n><LeftMouse><Cmd>lua require('vibrainium').action('workspace.double_click')<CR>",
+      );
+      expect(server.bufModeKeymaps['1:n:<2-LeftRelease>'], '<Nop>');
+      expect(server.bufModeKeymaps['1:x:<2-LeftRelease>'], '<Nop>');
+      expect(server.bufModeKeymaps['1:n:<LeftDrag>'], '<Nop>');
+      expect(server.bufModeKeymaps['1:x:<LeftDrag>'], '<Nop>');
+      expect(server.bufModeKeymaps['1:n:<2-LeftDrag>'], '<Nop>');
+      expect(server.bufModeKeymaps['1:x:<2-LeftDrag>'], '<Nop>');
+      expect(server.bufModeKeymaps['1:n:v'], '<Nop>');
+      expect(server.bufModeKeymaps['1:n:V'], '<Nop>');
+      expect(server.bufModeKeymaps['1:n:<C-v>'], '<Nop>');
+      expect(
+        server.bufVars[1]!['vibrainium_right_mouse_action'],
+        'workspace.context_menu',
       );
 
       expect(server.bufLines[1], [
@@ -341,6 +403,18 @@ void main() {
         FileOps.normalizePath('${workspaceDir.path}/lib/helper.dart'),
       );
 
+      await server.serverSession.request('vibrainium_action', ['workspace.open_external']);
+      expect(
+        launched.last.$2,
+        contains(FileOps.normalizePath('${workspaceDir.path}/lib/helper.dart')),
+      );
+
+      await server.serverSession.request('vibrainium_action', ['workspace.reveal_in_finder']);
+      expect(
+        launched.last.$2,
+        contains(FileOps.normalizePath('${workspaceDir.path}/lib/helper.dart')),
+      );
+
       await server.serverSession.request('vibrainium_action', ['workspace.copy']);
       expect(
         server.bufLines[1]![helperIdx],
@@ -385,6 +459,8 @@ void main() {
 
       await server.serverSession.request('vibrainium_action', ['workspace.open']);
       expect(await sidebar.isOpen(), isTrue);
+      expect(server.winConfigs[100]!['win'], -1);
+      expect(server.winConfigs[100]!['split'], 'left');
       expect(server.winConfigs[100]!['style'], 'minimal');
       expect(server.winOptions[100]!['number'], isFalse);
       expect(server.winOptions[100]!['relativenumber'], isFalse);
@@ -425,11 +501,20 @@ void main() {
     });
 
     test('supports mouse single-click, double-click, and right-click context menu', () async {
+      final launchedFromMenu = <(String, List<String>)>[];
       final server = _FakeNvimServer(cwd: workspaceDir.path);
-      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+      final sidebar = WorkspaceSidebar(
+        nvim: Nvim(server.clientSession),
+        processRunner: (exe, args) async {
+          launchedFromMenu.add((exe, args));
+          return ProcessResult(1, 0, '', '');
+        },
+      );
 
       await server.serverSession.request('vibrainium_action', ['workspace.open']);
       expect(await sidebar.isOpen(), isTrue);
+      expect(server.winConfigs[100]!['win'], -1);
+      expect(server.winConfigs[100]!['split'], 'left');
       expect(server.winConfigs[100]!['style'], 'minimal');
       expect(server.winOptions[100]!['number'], isFalse);
       expect(server.winOptions[100]!['relativenumber'], isFalse);
@@ -479,11 +564,22 @@ void main() {
       );
       expect(
         sidebar.contextMenu.items.map((i) => i.label),
-        containsAll(['Copy Filename', 'Copy Relative Path', 'Copy Absolute Path']),
+        containsAll([
+          'Open Externally',
+          'Reveal in Finder',
+          'Copy Filename',
+          'Copy Relative Path',
+          'Copy Absolute Path',
+        ]),
       );
       expect(
         server.bufKeymaps[menuBuf]!.keys,
-        containsAll(['<LeftMouse>', '<2-LeftMouse>', '<CR>', 'q', '<Esc>', '<RightMouse>', 'y', 'Y', 'gy']),
+        containsAll(['<LeftMouse>', '<2-LeftMouse>', '<CR>', 'q', '<Esc>', '<C-c>', 'o', 'O', 'y', 'Y', 'gy']),
+      );
+      expect(server.bufKeymaps[menuBuf]!.keys, isNot(contains('<RightMouse>')));
+      expect(
+        server.bufVars[menuBuf]!['vibrainium_right_mouse_action'],
+        'workspace.context_menu',
       );
 
       // Single-click back in sidebar (`workspace.click`) dismisses context menu
@@ -528,6 +624,22 @@ void main() {
       expect(
         server.registers['+'],
         FileOps.normalizePath('${workspaceDir.path}/lib/from_menu.dart'),
+      );
+
+      await server.serverSession.request('vibrainium_action', ['workspace.context_menu']);
+      final openExtIdx = sidebar.contextMenu.items.indexWhere((i) => i.label == 'Open Externally');
+      await server.serverSession.request('vibrainium_action', ['workspace.menu_select:$openExtIdx']);
+      expect(
+        launchedFromMenu.last.$2,
+        contains(FileOps.normalizePath('${workspaceDir.path}/lib/from_menu.dart')),
+      );
+
+      await server.serverSession.request('vibrainium_action', ['workspace.context_menu']);
+      final revealIdx = sidebar.contextMenu.items.indexWhere((i) => i.label == 'Reveal in Finder');
+      await server.serverSession.request('vibrainium_action', ['workspace.menu_select:$revealIdx']);
+      expect(
+        launchedFromMenu.last.$2,
+        contains(FileOps.normalizePath('${workspaceDir.path}/lib/from_menu.dart')),
       );
 
       // 7. Right-click on workspace header and trigger `Show Hidden Files` via shortcut (`menu_select`)
@@ -614,7 +726,7 @@ void main() {
         ..clear()
         ..addAll([10, 1, 2]);
       server.winBufs[10] = 50;
-      server.bufOptions[50] = {'buftype': 'nofile', 'filetype': 'viff'};
+      server.bufOptions[50] = {'buftype': 'nofile', 'filetype': 'vivcs'};
       server.winBufs[1] = 51;
       server.bufOptions[51] = {'buftype': '', 'filetype': 'dart'};
       server.winBufs[2] = 52;
@@ -718,6 +830,517 @@ void main() {
       );
       expect(server.currentWin, sidebarWin);
       expect(server.cursors[sidebarWin], (5, 0));
+
+      // Simulate daemon reconnect (`attachWindow(null)`) and concurrent sync_active_file calls with explicit path
+      sidebar.attachWindow(null);
+      sidebar.treeState.expandedDirs.clear();
+      server.currentWin = 1;
+      await Future.wait([
+        server.serverSession.request(
+          'vibrainium_action',
+          ['workspace.sync_active_file', deepFile.path],
+        ),
+        server.serverSession.request(
+          'vibrainium_action',
+          ['workspace.sync_active_file', deepFile.path],
+        ),
+      ]);
+      expect(sidebar.windowId, sidebarWin);
+      expect(server.cursors[sidebarWin], (5, 0));
+
+      await server.dispose();
+    });
+
+    test('double-clicking a file reuses dashboard/nofile main pane and tracks active editor pane across sync_active_file', () async {
+      final server = _FakeNvimServer(cwd: workspaceDir.path);
+      // Initial main pane (win 1) holds a dashboard (`buftype: nofile`, `filetype: snacks_dashboard`)
+      server.validWins
+        ..clear()
+        ..add(1);
+      server.winBufs[1] = 10;
+      server.bufOptions[10] = {'buftype': 'nofile', 'filetype': 'snacks_dashboard'};
+      server.currentWin = 1;
+
+      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      final sidebarWin = sidebar.windowId!;
+
+      // Expand `lib` (row 2)
+      server.mousePos = {
+        'winid': sidebarWin,
+        'winrow': 2,
+        'wincol': 4,
+        'line': 2,
+        'column': 4,
+        'screenrow': 2,
+        'screencol': 4,
+      };
+      await server.serverSession.request('vibrainium_action', ['workspace.double_click']);
+
+      // Double-clicking `main.dart` (row 3) reuses win 1 instead of running `botright vsplit`
+      server.commands.clear();
+      server.mousePos = {
+        'winid': sidebarWin,
+        'winrow': 3,
+        'wincol': 6,
+        'line': 3,
+        'column': 6,
+        'screenrow': 3,
+        'screencol': 6,
+      };
+      await server.serverSession.request('vibrainium_action', ['workspace.double_click']);
+      expect(server.currentWin, 1);
+      expect(server.commands.any((c) => c.contains('vsplit')), isFalse);
+      expect(
+        server.commands.any((c) => c.endsWith('/lib/main.dart')),
+        isTrue,
+      );
+
+      // Now simulate two editor splits (win 1 and win 2) where user switches to win 2
+      // and `workspace.sync_active_file` runs with an explicit file path argument,
+      // followed by alternateWin pointing to a non-editor window (win 99).
+      server.validWins.addAll([2, 99]);
+      server.winBufs[1] = 11;
+      server.bufOptions[11] = {'buftype': '', 'filetype': 'dart'};
+      server.winBufs[2] = 12;
+      server.bufOptions[12] = {'buftype': '', 'filetype': 'dart'};
+      server.winBufs[99] = 13;
+      server.bufOptions[13] = {'buftype': 'nofile', 'filetype': 'vibrainium-tabbar'};
+      server.alternateWin = 1;
+      server.currentWin = 2;
+
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.sync_active_file', '${workspaceDir.path}/README.md'],
+      );
+      expect(sidebar.lastActiveEditorWin, 2);
+
+      // Simulate focus moving through non-editor tabbar (99) to sidebarWin
+      server.currentWin = 99;
+      server.currentWin = sidebarWin;
+      server.commands.clear();
+      await server.serverSession.request('vibrainium_action', ['workspace.double_click']);
+
+      expect(server.currentWin, 2);
+      expect(server.commands.any((c) => c.contains('vsplit')), isFalse);
+      expect(
+        server.commands.any((c) => c.endsWith('/lib/main.dart')),
+        isTrue,
+      );
+
+      // Opening and cancelling a floating modal (workspace.new_file -> workspace.prompt_close)
+      // while in sidebar with a stale alternateWin (1) preserves lastActiveEditorWin == 2
+      server.currentWin = sidebarWin;
+      server.alternateWin = 1;
+      await server.serverSession.request('vibrainium_action', ['workspace.new_file']);
+      await server.serverSession.request('vibrainium_action', ['workspace.prompt_close']);
+      server.commands.clear();
+      await server.serverSession.request('vibrainium_action', ['workspace.double_click']);
+      expect(server.currentWin, 2);
+      expect(sidebar.lastActiveEditorWin, 2);
+
+      await server.dispose();
+    });
+
+    test('supports selecting a file for compare and comparing with a second file', () async {
+      final secondFile = File('${workspaceDir.path}/lib/second.dart');
+      await secondFile.writeAsString('void main() { print("v2"); }\n');
+
+      final server = _FakeNvimServer(cwd: workspaceDir.path);
+      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      final sidebarWin = sidebar.windowId!;
+
+      // Expand `lib` (row 2)
+      server.cursors[sidebarWin] = (2, 0);
+      await server.serverSession.request('vibrainium_action', ['workspace.enter']);
+
+      // Select `main.dart` (row 3) for compare
+      server.cursors[sidebarWin] = (3, 0);
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.select_for_compare'],
+      );
+      expect(
+        sidebar.viff.selectedCompareFilePath,
+        endsWith('/lib/main.dart'),
+      );
+
+      // Compare `second.dart` (row 4) with selected `main.dart`
+      server.cursors[sidebarWin] = (4, 0);
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.compare_with_selected'],
+      );
+      expect(sidebar.viff.activeTarget, isA<TwoFilesDiffTarget>());
+      expect(sidebar.viff.hunks, isNotEmpty);
+
+      await server.dispose();
+    });
+
+    test('supports persistent bottom search bar (/), live match expansion, cycling matches in bar and normal mode (n/N), and clearing search (<Esc>)', () async {
+      await Directory('${workspaceDir.path}/pkg_a/deep').create(recursive: true);
+      await Directory('${workspaceDir.path}/pkg_b/deep').create(recursive: true);
+      final targetA = File('${workspaceDir.path}/pkg_a/deep/item_1.dart');
+      final targetB = File('${workspaceDir.path}/pkg_b/deep/item_2.dart');
+      await targetA.writeAsString('');
+      await targetB.writeAsString('');
+
+      final server = _FakeNvimServer(cwd: workspaceDir.path);
+      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      final sidebarWin = sidebar.windowId!;
+
+      // Persistent bottom search split is automatically created below the sidebar window
+      expect(sidebar.searchPrompt.isOpen, isTrue);
+      final searchBuf = sidebar.searchPrompt.bufferId!;
+      final searchWin = sidebar.searchPrompt.windowId!;
+      expect(server.winConfigs[searchWin]!['split'], 'below');
+      expect(server.winConfigs[searchWin]!['win'], sidebarWin);
+      expect(server.winConfigs[searchWin]!['height'], 1);
+      expect(server.winOptions[searchWin]!['winfixheight'], isTrue);
+      expect(sidebar.searchPrompt.countLabel, '');
+
+      // Initially all top-level folders are collapsed and tree has no search rows
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '  pkg_a',
+        '  pkg_b',
+      ]);
+
+      // Press `/` -> `workspace.search` focuses the persistent bottom search bar
+      await server.serverSession.request('vibrainium_action', ['workspace.search']);
+      expect(server.currentWin, searchWin);
+
+      // Type regex `item_\d\.dart$` into persistent search bar buffer and fire `workspace.search_change`
+      server.bufLines[searchBuf] = [r'item_\d\.dart$'];
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.search_change'],
+      );
+
+      // First match (`pkg_a/deep/item_1.dart`) is auto-expanded and selected; search bar shows `[1/2]`
+      expect(sidebar.searchPrompt.countLabel, '[1/2]');
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '  pkg_a',
+        '    deep',
+        '       item_1.dart',
+        '  pkg_b',
+      ]);
+      expect(server.cursors[sidebarWin], (5, 0));
+
+      // Navigate to next match while still inside search bar (`<C-n>` -> `workspace.search_next`):
+      // `pkg_a/deep` collapses back, `pkg_b/deep` expands, and cursor moves to `item_2.dart` (`[2/2]`)
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.search_next'],
+      );
+      expect(sidebar.searchPrompt.countLabel, '[2/2]');
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '  pkg_a',
+        '  pkg_b',
+        '    deep',
+        '       item_2.dart',
+      ]);
+      expect(server.cursors[sidebarWin], (6, 0));
+
+      // Press `<CR>` in search bar (`workspace.search_submit`): keeps persistent search bar open and focuses sidebar on current match
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.search_submit'],
+      );
+      expect(sidebar.searchPrompt.isOpen, isTrue);
+      expect(server.validWins.contains(searchWin), isTrue);
+      expect(server.currentWin, sidebarWin);
+      expect(server.cursors[sidebarWin], (6, 0));
+
+      // Press `N` in sidebar normal mode (`workspace.search_prev`): wraps back to match 1,
+      // collapsing `pkg_b/deep` and expanding `pkg_a/deep`, and updates persistent search bar to `[1/2]`
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.search_prev'],
+      );
+      expect(sidebar.searchPrompt.countLabel, '[1/2]');
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '  pkg_a',
+        '    deep',
+        '       item_1.dart',
+        '  pkg_b',
+      ]);
+      expect(server.cursors[sidebarWin], (5, 0));
+
+      // Press `<Esc>` in sidebar normal mode (`workspace.clear_search`): clears search text & count while keeping persistent search bar open
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.clear_search'],
+      );
+      expect(sidebar.searchPrompt.isOpen, isTrue);
+      expect(server.bufLines[searchBuf], ['']);
+      expect(sidebar.searchPrompt.countLabel, '');
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '  pkg_a',
+        '    deep',
+        '       item_1.dart',
+        '  pkg_b',
+      ]);
+
+      await server.dispose();
+    });
+
+    test('opens new_file, new_folder, and rename input dialogs in insert mode on show and exits insert mode on close/submit', () async {
+      final server = _FakeNvimServer(cwd: workspaceDir.path);
+      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      final sidebarWin = sidebar.windowId!;
+
+      // Expand `lib` so `main.dart` is visible on row 3
+      server.cursors[sidebarWin] = (2, 0);
+      await server.serverSession.request('vibrainium_action', ['workspace.enter']);
+
+      // 1. `new_file` enters insert mode on show, does NOT bind <Esc> to close, binds 'q' in normal mode and <C-c> to close
+      server.commands.clear();
+      await server.serverSession.request('vibrainium_action', ['workspace.new_file']);
+      expect(sidebar.inputPrompt.isOpen, isTrue);
+      final newFileWin = sidebar.inputPrompt.windowId!;
+      final newFileBuf = sidebar.inputPrompt.bufferId!;
+      expect(server.currentWin, newFileWin);
+      expect(server.commands.last, 'startinsert!');
+      expect(server.winConfigs[newFileWin]!['title'], contains('q cancel'));
+      expect(server.bufModeKeymaps['$newFileBuf:i:<Esc>'], isNull);
+      expect(server.bufModeKeymaps['$newFileBuf:n:<Esc>'], isNull);
+      expect(
+        server.bufModeKeymaps['$newFileBuf:n:q'],
+        "<Cmd>lua require('vibrainium').action('workspace.prompt_close')<CR>",
+      );
+      expect(
+        server.bufModeKeymaps['$newFileBuf:i:<C-c>'],
+        "<Esc><Cmd>lua require('vibrainium').action('workspace.prompt_close')<CR>",
+      );
+      expect(
+        server.bufModeKeymaps['$newFileBuf:n:<C-c>'],
+        "<Cmd>lua require('vibrainium').action('workspace.prompt_close')<CR>",
+      );
+
+      // Cancelling via normal mode 'q' (`workspace.prompt_close`) calls `stopinsert` and returns focus to sidebar
+      server.commands.clear();
+      await server.serverSession.request('vibrainium_action', ['workspace.prompt_close']);
+      expect(sidebar.inputPrompt.isOpen, isFalse);
+      expect(server.commands, contains('stopinsert'));
+      expect(server.currentWin, sidebarWin);
+
+      // 2. `new_folder` enters insert mode on show and exits insert mode on submit
+      server.cursors[sidebarWin] = (1, 0);
+      server.commands.clear();
+      await server.serverSession.request('vibrainium_action', ['workspace.new_folder']);
+      expect(sidebar.inputPrompt.isOpen, isTrue);
+      expect(server.currentWin, sidebar.inputPrompt.windowId);
+      expect(server.commands.last, 'startinsert!');
+
+      server.bufLines[sidebar.inputPrompt.bufferId!] = ['assets'];
+      server.commands.clear();
+      await server.serverSession.request('vibrainium_action', ['workspace.prompt_submit']);
+      expect(sidebar.inputPrompt.isOpen, isFalse);
+      expect(server.commands, contains('stopinsert'));
+      expect(await Directory('${workspaceDir.path}/assets').exists(), isTrue);
+
+      // 3. `rename` enters insert mode on show with cursor placed at end of initial filename
+      final mainRow =
+          server.bufLines[1]!.indexWhere((l) => l.contains('main.dart')) + 1;
+      server.cursors[sidebarWin] = (mainRow, 0);
+      server.commands.clear();
+      await server.serverSession.request('vibrainium_action', ['workspace.rename']);
+      expect(sidebar.inputPrompt.isOpen, isTrue);
+      final renameWin = sidebar.inputPrompt.windowId!;
+      final renameBuf = sidebar.inputPrompt.bufferId!;
+      expect(server.currentWin, renameWin);
+      expect(server.bufLines[renameBuf], ['main.dart']);
+      expect(server.cursors[renameWin], (1, 'main.dart'.length));
+      expect(server.commands.last, 'startinsert!');
+
+      await server.serverSession.request('vibrainium_action', ['workspace.prompt_close']);
+
+      // 4. Triggering `New File` from right-click context menu also enters insert mode on show
+      server.cursors[sidebarWin] = (mainRow, 0);
+      await server.serverSession.request('vibrainium_action', ['workspace.context_menu']);
+      final newFileMenuIdx =
+          sidebar.contextMenu.items.indexWhere((i) => i.label == 'New File');
+      server.commands.clear();
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.menu_select:$newFileMenuIdx'],
+      );
+      expect(sidebar.inputPrompt.isOpen, isTrue);
+      expect(server.currentWin, sidebar.inputPrompt.windowId);
+      expect(server.commands.last, 'startinsert!');
+
+      await server.dispose();
+    });
+
+    test('does not move sidebar cursor on background sync_active_file when sidebar is focused', () async {
+      final deepFile = File('${workspaceDir.path}/lib/main.dart');
+      final server = _FakeNvimServer(cwd: workspaceDir.path);
+      server.winBufs[1] = 10;
+      server.bufOptions[10] = {'buftype': '', 'filetype': 'dart'};
+      server.bufNames[10] = deepFile.path;
+      server.currentWin = 1;
+
+      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      final sidebarWin = sidebar.windowId!;
+
+      // Opening sidebar auto-expands `lib` and places cursor on `main.dart` (row 3)
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '     main.dart',
+      ]);
+      expect(server.cursors[sidebarWin], (3, 0));
+
+      // Focus sidebar window and place cursor on header row (1)
+      server.currentWin = sidebarWin;
+      server.cursors[sidebarWin] = (1, 0);
+
+      // Background sync_active_file arrives (focusSidebar: false) while sidebar is focused
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.sync_active_file', deepFile.path],
+      );
+
+      // Sidebar cursor remains at row 1, NOT yanked to row 3 (main.dart)
+      expect(server.cursors[sidebarWin], (1, 0));
+
+      // Explicit reveal (focusSidebar: true) DOES move cursor to row 3
+      await server.serverSession.request(
+        'vibrainium_action',
+        ['workspace.reveal', deepFile.path],
+      );
+      expect(server.cursors[sidebarWin], (3, 0));
+
+      await server.dispose();
+    });
+
+    test('supports two rapid single clicks acting as double-click and debounces immediate duplicate event', () async {
+      final server = _FakeNvimServer(cwd: workspaceDir.path);
+      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      final sidebarWin = sidebar.windowId!;
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+      ]);
+
+      // 1. Two rapid single clicks on row 2 within 400ms acts as double-click and expands `lib`
+      server.cursors[sidebarWin] = (2, 0);
+      await server.serverSession.request('vibrainium_action', ['workspace.click']);
+      await server.serverSession.request('vibrainium_action', ['workspace.click']);
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '     main.dart',
+      ]);
+
+      // 2. An immediate duplicate `double_click` event (as sent by certain terminals right after rapid clicks) is debounced
+      // so it does NOT collapse `lib` back
+      await server.serverSession.request('vibrainium_action', ['workspace.double_click']);
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '     main.dart',
+      ]);
+
+      await server.dispose();
+    });
+
+    test('opens context menu reliably on cross-window right-click, empty space click, stale menu_close, and active prompt overlays', () async {
+      final server = _FakeNvimServer(cwd: workspaceDir.path);
+      final sidebar = WorkspaceSidebar(nvim: Nvim(server.clientSession));
+
+      await server.serverSession.request('vibrainium_action', ['workspace.open']);
+      final sidebarWin = sidebar.windowId!;
+
+      // Expand `lib` so row 3 is `main.dart`
+      server.cursors[sidebarWin] = (2, 0);
+      await server.serverSession.request('vibrainium_action', ['workspace.enter']);
+      expect(server.bufLines[1], [
+        '❖ demo_ws',
+        '  lib',
+        '     main.dart',
+      ]);
+
+      // 1. Focus editor window 1 while sidebar cursor is on row 1, then right-click row 3 in Explorer
+      //    using synchronous action coordinates from NvimMouseRouter (with mousePos = null).
+      server.currentWin = 1;
+      server.cursors[sidebarWin] = (1, 0);
+      server.mousePos = null;
+      await server.serverSession.request('vibrainium_action', [
+        'workspace.context_menu',
+        sidebarWin,
+        3,
+        3,
+        6,
+        3,
+        6,
+      ]);
+      expect(sidebar.contextMenu.isOpen, isTrue);
+      expect(server.cursors[sidebarWin], (3, 0));
+      final firstMenuBuf = sidebar.contextMenu.bufferId!;
+
+      // 2. Right-click empty area below tree lines (`line == 0, winRow == 12`) clamps to last line and reopens menu
+      await server.serverSession.request('vibrainium_action', [
+        'workspace.context_menu',
+        sidebarWin,
+        0,
+        12,
+        4,
+        12,
+        4,
+      ]);
+      expect(sidebar.contextMenu.isOpen, isTrue);
+      expect(server.cursors[sidebarWin], (3, 0));
+      final secondMenuBuf = sidebar.contextMenu.bufferId!;
+      expect(secondMenuBuf, isNot(firstMenuBuf));
+
+      // 3. Delayed WinLeave `workspace.menu_close` from `firstMenuBuf` does NOT close `secondMenuBuf`
+      await server.serverSession.request('vibrainium_action', [
+        'workspace.menu_close',
+        firstMenuBuf,
+      ]);
+      expect(sidebar.contextMenu.isOpen, isTrue);
+
+      // Matching `secondMenuBuf` DOES close it
+      await server.serverSession.request('vibrainium_action', [
+        'workspace.menu_close',
+        secondMenuBuf,
+      ]);
+      expect(sidebar.contextMenu.isOpen, isFalse);
+
+      // 4. Right-clicking Explorer while `InputPrompt` is open closes `InputPrompt` and opens `contextMenu`
+      await server.serverSession.request('vibrainium_action', ['workspace.new_file']);
+      expect(sidebar.inputPrompt.isOpen, isTrue);
+      await server.serverSession.request('vibrainium_action', [
+        'workspace.context_menu',
+        sidebarWin,
+        2,
+        2,
+        4,
+        2,
+        4,
+      ]);
+      expect(sidebar.inputPrompt.isOpen, isFalse);
+      expect(sidebar.contextMenu.isOpen, isTrue);
 
       await server.dispose();
     });

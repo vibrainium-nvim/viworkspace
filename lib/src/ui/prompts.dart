@@ -10,13 +10,17 @@ class InputPrompt {
   InputPrompt(this.nvim);
 
   bool get isOpen => _win != null;
+  int? get windowId => _win;
+  int? get bufferId => _buf;
 
   Future<void> open({
     required String title,
     String initialValue = '',
     required Future<void> Function(String value) onSubmit,
   }) async {
+    await nvim.activateOverlay(close);
     await close();
+    nvim.setOverlayCloser(close);
     _onSubmit = onSubmit;
 
     final buf = await nvim.createBuf(listed: false, scratch: true);
@@ -43,7 +47,7 @@ class InputPrompt {
       'height': height,
       'style': 'minimal',
       'border': 'rounded',
-      'title': ' $title — <CR> confirm, q/<Esc> cancel ',
+      'title': ' $title — <CR> confirm, q cancel ',
       'title_pos': 'center',
     });
     _win = win;
@@ -70,12 +74,41 @@ class InputPrompt {
       'q',
       "<Cmd>lua require('vibrainium').action('workspace.prompt_close')<CR>",
     );
-    await nvim.bufSetKeymap(
-      buf,
-      'n',
-      '<Esc>',
-      "<Cmd>lua require('vibrainium').action('workspace.prompt_close')<CR>",
-    );
+    // <C-c> closes the prompt in both normal and insert mode.
+    // In insert mode, <Esc> transitions to normal mode without closing.
+    // In normal mode, 'q' (or <C-c>) closes the prompt, while <Esc> stays in normal mode.
+    for (final mode in ['n', 'i']) {
+      await nvim.bufSetKeymap(
+        buf,
+        mode,
+        '<C-c>',
+        mode == 'i'
+            ? "<Esc><Cmd>lua require('vibrainium').action('workspace.prompt_close')<CR>"
+            : "<Cmd>lua require('vibrainium').action('workspace.prompt_close')<CR>",
+      );
+    }
+
+    try {
+      await nvim.execLua(
+        '''
+local buf = ...
+local grp = vim.api.nvim_create_augroup('ViworkspaceInputPrompt', { clear = true })
+vim.api.nvim_create_autocmd({ 'WinLeave', 'BufLeave' }, {
+  group = grp,
+  buffer = buf,
+  once = true,
+  callback = function()
+    vim.schedule(function()
+      require('vibrainium').action('workspace.prompt_close', buf)
+    end)
+  end,
+})
+''',
+        [buf],
+      );
+    } catch (_) {}
+
+    await nvim.command('startinsert!');
   }
 
   Future<void> submit() async {
@@ -97,11 +130,23 @@ class InputPrompt {
   }
 
   Future<void> close() async {
+    nvim.clearOverlayCloser(close);
     final win = _win;
+    final buf = _buf;
     _win = null;
     _buf = null;
     _onSubmit = null;
+    if (buf != null) {
+      try {
+        await nvim.execLua(
+          "pcall(vim.api.nvim_del_augroup_by_name, 'ViworkspaceInputPrompt')",
+        );
+      } catch (_) {}
+    }
     if (win != null) {
+      try {
+        await nvim.command('stopinsert');
+      } catch (_) {}
       try {
         if (await nvim.winIsValid(win)) {
           await nvim.winClose(win, force: true);
@@ -114,21 +159,27 @@ class InputPrompt {
 /// Floating confirmation modal for destructive actions (e.g. delete).
 class ConfirmPrompt {
   final Nvim nvim;
+  int? _buf;
   int? _win;
   Future<void> Function()? _onConfirm;
 
   ConfirmPrompt(this.nvim);
 
   bool get isOpen => _win != null;
+  int? get windowId => _win;
+  int? get bufferId => _buf;
 
   Future<void> open({
     required String message,
     required Future<void> Function() onConfirm,
   }) async {
+    await nvim.activateOverlay(close);
     await close();
+    nvim.setOverlayCloser(close);
     _onConfirm = onConfirm;
 
     final buf = await nvim.createBuf(listed: false, scratch: true);
+    _buf = buf;
     final line = ' $message (y/n) ';
 
     await nvim.bufSetOption(buf, 'modifiable', true);
@@ -157,6 +208,7 @@ class ConfirmPrompt {
       'title_pos': 'center',
     });
     _win = win;
+    await nvim.command('stopinsert');
 
     for (final key in ['y', 'Y', '<CR>']) {
       await nvim.bufSetKeymap(
@@ -166,7 +218,7 @@ class ConfirmPrompt {
         "<Cmd>lua require('vibrainium').action('workspace.confirm_yes')<CR>",
       );
     }
-    for (final key in ['n', 'N', 'q', '<Esc>']) {
+    for (final key in ['n', 'N', 'q', '<Esc>', '<C-c>']) {
       await nvim.bufSetKeymap(
         buf,
         'n',
@@ -174,6 +226,40 @@ class ConfirmPrompt {
         "<Cmd>lua require('vibrainium').action('workspace.confirm_no')<CR>",
       );
     }
+    for (final key in ['<Esc>', '<C-c>']) {
+      await nvim.bufSetKeymap(
+        buf,
+        'i',
+        key,
+        "<Cmd>lua require('vibrainium').action('workspace.confirm_no')<CR>",
+      );
+    }
+    await nvim.bufSetKeymap(
+      buf,
+      'n',
+      '<LeftMouse>',
+      "<Cmd>lua local m = vim.fn.getmousepos(); if m.winid ~= $win then require('vibrainium').action('workspace.confirm_no') end<CR>",
+    );
+
+    try {
+      await nvim.execLua(
+        '''
+local buf = ...
+local grp = vim.api.nvim_create_augroup('ViworkspaceConfirmPrompt', { clear = true })
+vim.api.nvim_create_autocmd({ 'WinLeave', 'BufLeave' }, {
+  group = grp,
+  buffer = buf,
+  once = true,
+  callback = function()
+    vim.schedule(function()
+      require('vibrainium').action('workspace.confirm_no', buf)
+    end)
+  end,
+})
+''',
+        [buf],
+      );
+    } catch (_) {}
   }
 
   Future<void> confirm() async {
@@ -185,9 +271,19 @@ class ConfirmPrompt {
   }
 
   Future<void> close() async {
+    nvim.clearOverlayCloser(close);
     final win = _win;
+    final buf = _buf;
     _win = null;
+    _buf = null;
     _onConfirm = null;
+    if (buf != null) {
+      try {
+        await nvim.execLua(
+          "pcall(vim.api.nvim_del_augroup_by_name, 'ViworkspaceConfirmPrompt')",
+        );
+      } catch (_) {}
+    }
     if (win != null) {
       try {
         if (await nvim.winIsValid(win)) {
@@ -199,202 +295,293 @@ class ConfirmPrompt {
 }
 
 /// A single entry in the workspace right-click [ContextMenuPrompt].
-class ContextMenuItem {
-  final String label;
-  final String shortcut;
-  final Future<void> Function() onSelect;
-
+class ContextMenuItem extends NvimContextMenuItem {
   const ContextMenuItem({
-    required this.label,
-    required this.shortcut,
-    required this.onSelect,
+    required super.label,
+    super.displayLabel,
+    required super.shortcut,
+    super.isSubmenu = false,
+    required super.onSelect,
   });
 }
 
 /// Floating context menu for right-click actions in the workspace sidebar.
-class ContextMenuPrompt {
-  final Nvim nvim;
-  int? _buf;
-  int? _win;
-  List<ContextMenuItem> _items = const [];
-  Future<void> Function()? _onCancel;
-
-  ContextMenuPrompt(this.nvim);
-
-  bool get isOpen => _win != null;
-  int? get windowId => _win;
-  int? get bufferId => _buf;
-  List<ContextMenuItem> get items => List.unmodifiable(_items);
+class ContextMenuPrompt extends NvimContextMenu<ContextMenuItem> {
+  ContextMenuPrompt(Nvim nvim)
+      : super(
+          nvim: nvim,
+          actionPrefix: 'workspace',
+          filetype: 'viworkspace-menu',
+          augroupName: 'ViworkspaceContextMenu',
+          rightClickAction: 'workspace.context_menu',
+        );
 
   Future<void> open({
-    required List<ContextMenuItem> items,
+    List<ContextMenuItem>? items,
+    List<NvimContextMenuRow<ContextMenuItem>>? rows,
     String title = 'Actions',
     int? anchorWin,
     int row = 1,
     int col = 2,
     Future<void> Function()? onCancel,
-  }) async {
-    await close();
-    if (items.isEmpty) return;
+  }) =>
+      openMenu(
+        items: items,
+        rows: rows,
+        title: title,
+        anchorWin: anchorWin,
+        row: row,
+        col: col,
+        maxWidth: 60,
+        onCancel: onCancel,
+      );
+}
 
-    _items = items;
-    _onCancel = onCancel;
+/// Persistent 1-line regex search bar split docked at the bottom of the workspace sidebar.
+class SearchPrompt {
+  final Nvim nvim;
+  int? _nsId;
+  int? _buf;
+  int? _win;
+  String _countLabel = '';
 
-    final buf = await nvim.createBuf(listed: false, scratch: true);
-    _buf = buf;
+  SearchPrompt(this.nvim);
 
-    var maxLabelLen = 0;
-    var maxShortcutLen = 0;
-    for (final item in items) {
-      if (item.label.length > maxLabelLen) {
-        maxLabelLen = item.label.length;
-      }
-      if (item.shortcut.length > maxShortcutLen) {
-        maxShortcutLen = item.shortcut.length;
-      }
+  bool get isOpen => _win != null;
+  int? get windowId => _win;
+  int? get bufferId => _buf;
+  String get countLabel => _countLabel;
+
+  static String formatMatchCount({
+    required String query,
+    required int currentMatchIndex,
+    required int totalMatches,
+  }) {
+    if (query.isEmpty) {
+      return '';
     }
+    final displayIdx =
+        (totalMatches > 0 && currentMatchIndex >= 0) ? currentMatchIndex + 1 : 0;
+    return '[$displayIdx/$totalMatches]';
+  }
 
-    final innerWidth = (maxLabelLen + maxShortcutLen + 4).clamp(22, 48);
-    final lines = <String>[];
-    for (final item in items) {
-      final padCount =
-          (innerWidth - 2 - item.label.length - item.shortcut.length)
-              .clamp(1, innerWidth);
-      lines.add(' ${item.label}${' ' * padCount}${item.shortcut} ');
+  Future<int> ensureBuffer({String initialQuery = ''}) async {
+    _nsId ??= await nvim.createNamespace('viworkspace_search');
+    var buf = _buf;
+    if (buf == null || !await nvim.bufIsValid(buf)) {
+      buf = await nvim.createBuf(listed: false, scratch: true);
+      _buf = buf;
+
+      await nvim.bufSetOption(buf, 'modifiable', true);
+      await nvim.bufSetOption(buf, 'buftype', 'nofile');
+      await nvim.bufSetOption(buf, 'bufhidden', 'hide');
+      await nvim.bufSetOption(buf, 'swapfile', false);
+      await nvim.bufSetOption(buf, 'filetype', 'viworkspace-search');
+      await nvim.bufSetLines(buf, lines: [initialQuery]);
+      await _bindKeys(buf);
     }
+    return buf;
+  }
 
-    await nvim.bufSetOption(buf, 'modifiable', true);
-    await nvim.bufSetLines(buf, lines: lines);
-    await nvim.bufSetOption(buf, 'modifiable', false);
-    await nvim.bufSetOption(buf, 'buftype', 'nofile');
-    await nvim.bufSetOption(buf, 'bufhidden', 'wipe');
-    await nvim.bufSetOption(buf, 'filetype', 'viworkspace-menu');
-
-    final config = <String, Object?>{
-      if (anchorWin != null) ...{
-        'relative': 'win',
-        'win': anchorWin,
-        'row': row,
-        'col': col,
-      } else ...{
-        'relative': 'editor',
-        'row': row,
-        'col': col,
-      },
-      'width': innerWidth,
-      'height': lines.length,
-      'style': 'minimal',
-      'border': 'rounded',
-      'title': ' $title ',
-      'title_pos': 'center',
-    };
-
-    final win = await nvim.openWin(buf, true, config);
-    _win = win;
-
-    await nvim.winSetOption(win, 'cursorline', true);
-    await nvim.winSetOption(win, 'wrap', false);
-    await nvim.winSetCursor(win, 1, 0);
-
-    await nvim.bufSetKeymap(
-      buf,
-      'n',
-      '<LeftMouse>',
-      "<LeftMouse><Cmd>lua require('vibrainium').action('workspace.menu_click')<CR>",
-    );
-    await nvim.bufSetKeymap(
-      buf,
-      'n',
-      '<2-LeftMouse>',
-      "<LeftMouse><Cmd>lua require('vibrainium').action('workspace.menu_click')<CR>",
-    );
+  Future<void> _bindKeys(int buf) async {
     await nvim.bufSetKeymap(
       buf,
       'n',
       '<CR>',
-      "<Cmd>lua require('vibrainium').action('workspace.menu_confirm')<CR>",
+      "<Cmd>lua require('vibrainium').action('workspace.search_submit')<CR>",
+    );
+    await nvim.bufSetKeymap(
+      buf,
+      'i',
+      '<CR>',
+      "<Esc><Cmd>lua require('vibrainium').action('workspace.search_submit')<CR>",
     );
     await nvim.bufSetKeymap(
       buf,
       'n',
-      '<RightMouse>',
-      "<Cmd>lua require('vibrainium').action('workspace.context_menu')<CR>",
+      'q',
+      "<Cmd>lua require('vibrainium').action('workspace.search_close')<CR>",
     );
-    for (final key in ['q', '<Esc>']) {
-      await nvim.bufSetKeymap(
-        buf,
-        'n',
-        key,
-        "<Cmd>lua require('vibrainium').action('workspace.menu_close')<CR>",
+
+    for (final mode in ['n', 'i']) {
+      for (final key in ['<C-n>', '<Down>', '<Tab>']) {
+        await nvim.bufSetKeymap(
+          buf,
+          mode,
+          key,
+          "<Cmd>lua require('vibrainium').action('workspace.search_next')<CR>",
+        );
+      }
+      for (final key in ['<C-p>', '<Up>', '<S-Tab>']) {
+        await nvim.bufSetKeymap(
+          buf,
+          mode,
+          key,
+          "<Cmd>lua require('vibrainium').action('workspace.search_prev')<CR>",
+        );
+      }
+      for (final key in ['<Esc>', '<C-c>']) {
+        await nvim.bufSetKeymap(
+          buf,
+          mode,
+          key,
+          mode == 'i'
+              ? "<Esc><Cmd>lua require('vibrainium').action('workspace.search_close')<CR>"
+              : "<Cmd>lua require('vibrainium').action('workspace.search_close')<CR>",
+        );
+      }
+    }
+
+    try {
+      await nvim.execLua(
+        '''
+local buf = ...
+local grp = vim.api.nvim_create_augroup('ViworkspaceSearchPrompt', { clear = true })
+vim.api.nvim_create_autocmd({ 'TextChangedI', 'TextChanged' }, {
+  group = grp,
+  buffer = buf,
+  callback = function()
+    vim.schedule(function()
+      require('vibrainium').action('workspace.search_change')
+    end)
+  end,
+})
+''',
+        [buf],
       );
-    }
-
-    for (var i = 0; i < items.length; i++) {
-      final key = items[i].shortcut;
-      if (key.isEmpty || key == '<CR>' || key == 'q' || key == '<Esc>') {
-        continue;
-      }
-      await nvim.bufSetKeymap(
-        buf,
-        'n',
-        key,
-        "<Cmd>lua require('vibrainium').action('workspace.menu_select:$i')<CR>",
-      );
-    }
+    } catch (_) {}
   }
 
-  Future<void> handleClick() async {
-    final win = _win;
+  /// Ensures the persistent 1-line bottom search split window exists below [sidebarWin].
+  Future<int?> ensureWindow({
+    required int? sidebarWin,
+    String query = '',
+    int currentMatchIndex = -1,
+    int totalMatches = 0,
+  }) async {
+    if (sidebarWin == null || !await nvim.winIsValid(sidebarWin)) {
+      return null;
+    }
+    final buf = await ensureBuffer(initialQuery: query);
+    var win = _win;
     if (win == null || !await nvim.winIsValid(win)) {
-      await close();
-      return;
-    }
-    final mousePos = await nvim.getMousePos();
-    if (mousePos != null) {
-      if (mousePos.winId != win) {
-        await close();
-        return;
+      win = await nvim.openWin(buf, false, {
+        'win': sidebarWin,
+        'split': 'below',
+        'height': 1,
+        'style': 'minimal',
+      });
+      _win = win;
+      await nvim.winSetOption(win, 'number', false);
+      await nvim.winSetOption(win, 'relativenumber', false);
+      await nvim.winSetOption(win, 'signcolumn', 'no');
+      await nvim.winSetOption(win, 'foldcolumn', '0');
+      await nvim.winSetOption(win, 'statuscolumn', '  ');
+      await nvim.winSetOption(win, 'wrap', false);
+      await nvim.winSetOption(win, 'cursorline', false);
+      await nvim.winSetOption(win, 'winfixheight', true);
+      await nvim.winSetOption(win, 'winfixwidth', true);
+    } else {
+      final currentBuf = await nvim.winGetBuf(win);
+      if (currentBuf != buf) {
+        await nvim.winSetBuf(win, buf);
       }
-      if (mousePos.line >= 1 && mousePos.line <= _items.length) {
-        await selectIndex(mousePos.line - 1);
-        return;
-      }
     }
-    await confirm();
+    await updateStatus(
+      query: query,
+      currentMatchIndex: currentMatchIndex,
+      totalMatches: totalMatches,
+    );
+    return win;
   }
 
-  Future<void> confirm() async {
-    final win = _win;
-    if (win == null || !await nvim.winIsValid(win)) {
-      await close();
-      return;
+  /// Focuses the persistent bottom search bar and enters insert mode.
+  Future<void> focus({
+    required int? sidebarWin,
+    String query = '',
+    int currentMatchIndex = -1,
+    int totalMatches = 0,
+  }) async {
+    final win = await ensureWindow(
+      sidebarWin: sidebarWin,
+      query: query,
+      currentMatchIndex: currentMatchIndex,
+      totalMatches: totalMatches,
+    );
+    if (win == null || !await nvim.winIsValid(win)) return;
+    await nvim.setCurrentWin(win);
+    final currentText = await readQuery();
+    if (currentText.isNotEmpty) {
+      await nvim.winSetCursor(win, 1, currentText.length);
     }
-    final (row, _) = await nvim.winGetCursor(win);
-    await selectIndex(row - 1);
+    await nvim.command('startinsert!');
   }
 
-  Future<void> selectIndex(int index) async {
-    final items = _items;
-    await close();
-    if (index >= 0 && index < items.length) {
-      await items[index].onSelect();
+  Future<String> readQuery() async {
+    final buf = _buf;
+    if (buf == null || !await nvim.bufIsValid(buf)) return '';
+    final lines = await nvim.bufGetLines(buf);
+    return lines.isEmpty ? '' : lines.first;
+  }
+
+  Future<void> setQuery(
+    String query, {
+    int currentMatchIndex = -1,
+    int totalMatches = 0,
+  }) async {
+    final buf = _buf;
+    if (buf != null && await nvim.bufIsValid(buf)) {
+      await nvim.bufSetOption(buf, 'modifiable', true);
+      await nvim.bufSetLines(buf, lines: [query]);
+    }
+    await updateStatus(
+      query: query,
+      currentMatchIndex: currentMatchIndex,
+      totalMatches: totalMatches,
+    );
+  }
+
+  Future<void> updateStatus({
+    required String query,
+    required int currentMatchIndex,
+    required int totalMatches,
+  }) async {
+    _countLabel = formatMatchCount(
+      query: query,
+      currentMatchIndex: currentMatchIndex,
+      totalMatches: totalMatches,
+    );
+    final buf = _buf;
+    final nsId = _nsId;
+    if (buf == null || nsId == null || !await nvim.bufIsValid(buf)) return;
+    await nvim.bufClearNamespace(buf, nsId);
+    if (query.isEmpty) {
+      await nvim.bufSetExtmark(buf, nsId, 0, 0, {
+        'virt_text': [
+          ['Search (Regex)...', 'ViworkspaceMuted'],
+        ],
+        'virt_text_pos': 'eol',
+      });
+    } else {
+      await nvim.bufSetExtmark(buf, nsId, 0, 0, {
+        'virt_text': [
+          [' $_countLabel ', 'ViworkspaceSearchCount'],
+        ],
+        'virt_text_pos': 'right_align',
+      });
     }
   }
 
-  Future<void> cancel() async {
-    final callback = _onCancel;
-    await close();
-    if (callback != null) {
-      await callback();
+  Future<void> onHotReloaded() async {
+    final buf = _buf;
+    if (buf != null && await nvim.bufIsValid(buf)) {
+      await _bindKeys(buf);
     }
   }
 
   Future<void> close() async {
     final win = _win;
     _win = null;
-    _buf = null;
-    _items = const [];
-    _onCancel = null;
     if (win != null) {
       try {
         if (await nvim.winIsValid(win)) {

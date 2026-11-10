@@ -250,6 +250,7 @@ void main() {
           'N',
           '<Esc>',
           'r',
+          'D',
           'd',
           'c',
           'x',
@@ -592,7 +593,7 @@ void main() {
       await server.serverSession.request('vibrainium_action', ['workspace.context_menu']);
       expect(sidebar.contextMenu.isOpen, isTrue);
       final menuWin2 = sidebar.contextMenu.windowId!;
-      final newFileRow = sidebar.contextMenu.items.indexWhere((i) => i.label == 'New File') + 1;
+      final newFileRow = sidebar.contextMenu.rowIndexWhere((i) => i.label == 'New File') + 1;
       server.cursors[menuWin2] = (newFileRow, 0);
       await server.serverSession.request('vibrainium_action', ['workspace.menu_confirm']);
       expect(sidebar.contextMenu.isOpen, isFalse);
